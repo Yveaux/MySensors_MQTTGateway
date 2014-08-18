@@ -91,7 +91,7 @@ use constant datastreamTypesToStr => qw{ ST_FIRMWARE_CONFIG_REQUEST ST_FIRMWARE_
 use enum qw { P_STRING=0 P_BYTE P_INT16 P_UINT16 P_LONG32 P_ULONG32 P_CUSTOM };
 use constant payloadTypesToStr => qw{ P_STRING P_BYTE P_INT16 P_UINT16 P_LONG32 P_ULONG32 P_CUSTOM };
 
-use constant topicRoot => 'mySensors';    # Omit trailing slash
+use constant topicRoot => '/mySensors';    # Include leading slash, omit trailing slash
 
 my $mqttHost = 'localhost';         # Hostname of MQTT broker
 my $mqttPort = 1883;                # Port of MQTT broker

@@ -79,7 +79,7 @@ use constant sensorTypesToStr => qw{ S_DOOR S_MOTION S_SMOKE S_LIGHT S_DIMMER S_
         S_RAIN S_UV S_WEIGHT S_POWER S_HEATER S_DISTANCE S_LIGHT_LEVEL S_ARDUINO_NODE
         S_ARDUINO_RELAY S_LOCK S_IR S_WATER };
         
-use constant topicRoot => 'mySensors';    # Omit trailing slash
+use constant topicRoot => '/mySensors';    # Include leading slash, omit trailing slash
 
 my $mqttHost = 'localhost';         # Hostname of MQTT broker
 my $mqttPort = 1883;                # Port of MQTT broker
