@@ -477,24 +477,24 @@ while (1)
 #          clean_session => 0,   # Retain client subscriptions etc
           client_id => 'MySensors',
           );
-    # if ($useSerial==0) {
-      # tcp_connect($mysnsHost, $mysnsPort, sub {
-          # my $sock = shift or die "FAIL";
-          # my $handle;
-          # $handle = AnyEvent::Handle->new(
-               # fh => $sock,
-               # on_error => \&onSocketError,
-               # on_eof => sub {
-                  # print "DISCONNECT!\n";
-                  # $handle->destroy();
-               # },
-               # on_connect => sub {
-                 # my ($handle, $host, $port) = @_;
-                  # print "Connected to MySensors gateway at $host:$port\n";
-               # },
-               # on_read => \&onSocketRead );
-        # }  );
-    # }
+    if ($useSerial==0) {
+      tcp_connect($mysnsHost, $mysnsPort, sub {
+          my $sock = shift or die "FAIL";
+          my $handle;
+          $handle = AnyEvent::Handle->new(
+               fh => $sock,
+               on_error => \&onSocketError,
+               on_eof => sub {
+                  print "DISCONNECT!\n";
+                  $handle->destroy();
+               },
+               on_connect => sub {
+                 my ($handle, $host, $port) = @_;
+                  print "Connected to MySensors gateway at $host:$port\n";
+               },
+               on_read => \&onSocketRead );
+        }  );
+    }
     
     $cv = AnyEvent->condvar;
     
