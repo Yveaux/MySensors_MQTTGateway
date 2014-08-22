@@ -24,6 +24,7 @@
 #
 
 local $ENV{ANYEVENT_MQTT_DEBUG} = 1;
+my $useSerial  = 1;
 
 use strict;
 use Cwd;
@@ -31,7 +32,7 @@ use IO::Socket::INET;
 use Net::MQTT::Constants;
 #use AnyEvent::IO;
 use AnyEvent::Socket;
-#use AnyEvent::Handle;
+use AnyEvent::Handle;
 use AnyEvent::MQTT;
 use AnyEvent::Strict;   # check parameters passed to callbacks 
 #use WebSphere::MQTT::Client;
@@ -39,7 +40,7 @@ use Data::Dumper;
 use List::Util qw(first);
 use Storable;
 use v5.14;              # Requires support for given/when constructs
-
+use Device::SerialPort;
 
 #-- Message types
 use enum qw { C_PRESENTATION=0 C_SET C_REQ C_INTERNAL C_STREAM };
@@ -94,13 +95,16 @@ use constant payloadTypesToStr => qw{ P_STRING P_BYTE P_INT16 P_UINT16 P_LONG32 
 use constant topicRoot => '/mySensors';    # Include leading slash, omit trailing slash
 
 my $mqttHost = 'localhost';         # Hostname of MQTT broker
-my $mqttPort = 1883;                # Port of MQTT broker
+my $mqttPort = 8883;                # Port of MQTT broker
 my $mysnsHost = '192.168.1.10';     # IP of MySensors Ethernet gateway
 my $mysnsPort = 5003;               # Port of MySensors Ethernet gateway
 my $retain = 1;
 my $qos = MQTT_QOS_AT_LEAST_ONCE;
 my $keep_alive_timer = 120;
 my $subscriptionStorageFile = "subscriptions.storage";
+my $cv;
+my $serialPort = "/dev/ttyUSB2";
+my $serialDevice;
 
 my @subscriptions;
 
@@ -109,17 +113,87 @@ sub debug
   print "##" . join(" ", @_)."\n";
 }
 
+sub initialiseSerialPort
+{
+  print "Initialising serial port  $serialPort\n";
+	$serialDevice =  tie (*FH, 'Device::SerialPort', $serialPort)
+    || die "Can't tie: $!";
+	$serialDevice->baudrate(115200);
+	$serialDevice->databits(8);
+	$serialDevice->parity("none");
+	$serialDevice->stopbits(1);
+  
+  
+	my $tEnd = time()+2; # 2 seconds in future
+	while (time()< $tEnd) { # end latest after 2 seconds
+		my $c = $serialDevice->lookfor(); # char or nothing
+		next if $c eq ""; # restart if noting
+		print $c; # uncomment if you want to see the gremlin
+		last;
+	}
+	while (1) { # and all the rest of the gremlins as they come in one piece
+		my $c = $serialDevice->lookfor(); # get the next one
+		last if $c eq ""; # or we're done
+		print $c; # uncomment if you want to see the gremlin
+	}
+}
+
+sub sendToSerialGateway
+{
+	my $message = shift;
+  $serialPort->write($message."\n");
+  print "Wrote to serial port: ".$message;
+}
+
+# sub readFromSerialGateway
+# {
+  # my $char = $serialDevice->lookfor();
+  # my $output = "";
+  # while ($char ne "" && $char ne "\n") {
+    # $output.= $char;
+    # # Uncomment the following lines, for slower reading,
+    # # but lower CPU usage, and to avoid
+    # # buffer overflow due to sleep function.
+ 
+    # # $port->lookclear;
+    # # sleep (1);
+    # $char = $serialDevice->lookfor();
+  # }
+  # print "Received serial string $output\n";
+  # return $output;
+# }
+  
+sub create_handle {
+  new AnyEvent::Handle(
+    fh => $serialDevice->{'HANDLE'},
+    on_error => sub {
+      my ($handle, $fatal, $message) = @_;
+      $handle->destroy;
+      undef $handle;
+      $cv->send("$fatal: $message");
+    },
+    on_read => sub {
+      my $handle = shift;
+      $handle->push_read(line => sub {
+        my ($handle, $line) = @_;
+        onSerialRead($line);
+      });
+    }
+  );
+}  
+    
 sub parseMsg
 {
   my $txt = shift;
+  chomp $txt;
   my @fields = split(/;/,$txt);
   my $msgRef = { radioId => $fields[0],
                  childId => $fields[1],
                  cmd     => $fields[2],
                  ack     => 0,
 #                 ack     => $fields[3],    # ack is not (yet) passed with message
-                 subType => $fields[3],
-                 payload => $fields[4] };
+                 subType => $fields[4],
+                 payload => $fields[5] };
   return $msgRef;
 }
 
@@ -188,12 +262,14 @@ sub createTopic
 my $mqtt;
 # Open a separate socket connection for sending.
 # TODO: I guess this should not be required.... Figure out how...
-my $socktx = new IO::Socket::INET (
-  PeerHost => $mysnsHost,
-  PeerPort => $mysnsPort,
-  Proto => 'tcp',
-) or die "ERROR in Socket Creation : $!\n";
-
+my $socktx;
+if($useSerial== 0) {
+  $socktx = new IO::Socket::INET (
+    PeerHost => $mysnsHost,
+    PeerPort => $mysnsPort,
+    Proto => 'tcp',
+  ) or die "ERROR in Socket Creation : $!\n";
+}
 
 # Callback called when MQTT generates an error
 sub onMqttError
@@ -215,7 +291,11 @@ sub onMqttPublish
   my $mySnsMsg = createMsg($msgRef);
   debug($mySnsMsg); 
   print "Publish $topic: $message => $mySnsMsg\n";
-  print $socktx "$mySnsMsg\n"; 
+  if ($useSerial== 0) {
+    print $socktx "$mySnsMsg\n"; 
+  } else {
+  
+  }
 }                                  
 
 # Callback called when socket connection generates an error
@@ -338,6 +418,33 @@ sub onSocketRead
   $handle->rbuf = "";
 }
 
+sub onSerialRead
+{
+  my ($line) = @_;
+    debug($line);
+
+  my $msgRef = parseMsg($line);
+  dumpMsg($msgRef);
+  given ($msgRef->{'cmd'})
+  {
+    when ([C_PRESENTATION, C_SET, C_INTERNAL])
+    {
+      onNodePresenation($msgRef) if (($msgRef->{'childId'} == 255) && ($msgRef->{'cmd'} == C_PRESENTATION));
+      publish( createTopic($msgRef), $msgRef->{'payload'} );
+    }
+    when (C_REQ)
+    {
+      subscribe( createTopic($msgRef) );
+    }
+    default
+    {
+      # Ignore
+    }
+  }
+  
+  # Clear the buffer
+  }
+
 sub doShutdown
 {
   store(\@subscriptions, $subscriptionStorageFile) ;
@@ -352,7 +459,9 @@ sub onCtrlC
 
 # Install Ctrl-C handler
 $SIG{INT} = \&onCtrlC;
+my $serialHandle;
 
+initialiseSerialPort();
 while (1)
 {
   # Run code in eval loop, so die's are caught with error message stored in $@
@@ -368,24 +477,31 @@ while (1)
 #          clean_session => 0,   # Retain client subscriptions etc
           client_id => 'MySensors',
           );
-
-    tcp_connect($mysnsHost, $mysnsPort, sub {
-        my $sock = shift or die "FAIL";
-        my $handle;
-        $handle = AnyEvent::Handle->new(
-             fh => $sock,
-             on_error => \&onSocketError,
-             on_eof => sub {
-                print "DISCONNECT!\n";
-                $handle->destroy();
-             },
-             on_connect => sub {
-               my ($handle, $host, $port) = @_;
-                print "Connected to MySensors gateway at $host:$port\n";
-             },
-             on_read => \&onSocketRead );
-      }  );
-
+    # if ($useSerial==0) {
+      # tcp_connect($mysnsHost, $mysnsPort, sub {
+          # my $sock = shift or die "FAIL";
+          # my $handle;
+          # $handle = AnyEvent::Handle->new(
+               # fh => $sock,
+               # on_error => \&onSocketError,
+               # on_eof => sub {
+                  # print "DISCONNECT!\n";
+                  # $handle->destroy();
+               # },
+               # on_connect => sub {
+                 # my ($handle, $host, $port) = @_;
+                  # print "Connected to MySensors gateway at $host:$port\n";
+               # },
+               # on_read => \&onSocketRead );
+        # }  );
+    # }
+    
+    $cv = AnyEvent->condvar;
+    
+    if ($useSerial==1) {
+      $serialHandle = create_handle();
+    }
+    
     # On shutdown active subscriptions will be saved to file. Read this file here and restore subscriptions.
     if (-e $subscriptionStorageFile)
     {
@@ -397,7 +513,7 @@ while (1)
       }
     }
     
-    my $cv = AnyEvent->condvar;
+
     $cv->recv; 
   }
   or do
