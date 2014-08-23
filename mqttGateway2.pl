@@ -50,12 +50,14 @@ use enum qw { V_TEMP=0 V_HUM V_LIGHT V_DIMMER V_PRESSURE V_FORECAST V_RAIN
         V_RAINRATE V_WIND V_GUST V_DIRECTION V_UV V_WEIGHT V_DISTANCE
         V_IMPEDANCE V_ARMED V_TRIPPED V_WATT V_KWH V_SCENE_ON V_SCENE_OFF
         V_HEATER V_HEATER_SW V_LIGHT_LEVEL V_VAR1 V_VAR2 V_VAR3 V_VAR4 V_VAR5
-        V_UP V_DOWN V_STOP V_IR_SEND V_IR_RECEIVE V_FLOW V_VOLUME V_LOCK_STATUS };
+        V_UP V_DOWN V_STOP V_IR_SEND V_IR_RECEIVE V_FLOW V_VOLUME V_LOCK_STATUS
+        V_DUST_LEVEL };
 use constant variableTypesToStr => qw{ V_TEMP V_HUM V_LIGHT V_DIMMER V_PRESSURE V_FORECAST V_RAIN
         V_RAINRATE V_WIND V_GUST V_DIRECTION V_UV V_WEIGHT V_DISTANCE
         V_IMPEDANCE V_ARMED V_TRIPPED V_WATT V_KWH V_SCENE_ON V_SCENE_OFF
         V_HEATER V_HEATER_SW V_LIGHT_LEVEL V_VAR1 V_VAR2 V_VAR3 V_VAR4 V_VAR5
-        V_UP V_DOWN V_STOP V_IR_SEND V_IR_RECEIVE V_FLOW V_VOLUME V_LOCK_STATUS };
+        V_UP V_DOWN V_STOP V_IR_SEND V_IR_RECEIVE V_FLOW V_VOLUME V_LOCK_STATUS
+        V_DUST_LEVEL };
 
 sub variableTypeToIdx
 {
@@ -65,21 +67,23 @@ sub variableTypeToIdx
 
 #-- Internal messages
 use enum qw { I_BATTERY_LEVEL=0 I_TIME I_VERSION I_ID_REQUEST I_ID_RESPONSE
-        I_INCLUSION_MODE I_CONFIG I_PING I_PING_ACK
+        I_INCLUSION_MODE I_CONFIG I_FIND_PARENT I_FIND_PARENT_RESPONSE
         I_LOG_MESSAGE I_CHILDREN I_SKETCH_NAME I_SKETCH_VERSION
         I_REBOOT };
 use constant internalMessageTypesToStr => qw{ I_BATTERY_LEVEL I_TIME I_VERSION I_ID_REQUEST I_ID_RESPONSE
-        I_INCLUSION_MODE I_CONFIG I_PING I_PING_ACK
+        I_INCLUSION_MODE I_CONFIG I_FIND_PARENT I_FIND_PARENT_RESPONSE
         I_LOG_MESSAGE I_CHILDREN I_SKETCH_NAME I_SKETCH_VERSION
         I_REBOOT };
 
 #-- Sensor types
 use enum qw { S_DOOR=0 S_MOTION S_SMOKE S_LIGHT S_DIMMER S_COVER S_TEMP S_HUM S_BARO S_WIND
         S_RAIN S_UV S_WEIGHT S_POWER S_HEATER S_DISTANCE S_LIGHT_LEVEL S_ARDUINO_NODE
-        S_ARDUINO_REPEATER_NODE S_LOCK S_IR S_WATER S_AIR_QUALITY };
+        S_ARDUINO_REPEATER_NODE S_LOCK S_IR S_WATER S_AIR_QUALITY S_CUSTOM S_DUST
+        S_SCENE_CONTROLLER };
 use constant sensorTypesToStr => qw{ S_DOOR S_MOTION S_SMOKE S_LIGHT S_DIMMER S_COVER S_TEMP S_HUM S_BARO S_WIND
         S_RAIN S_UV S_WEIGHT S_POWER S_HEATER S_DISTANCE S_LIGHT_LEVEL S_ARDUINO_NODE
-        S_ARDUINO_REPEATER_NODE S_LOCK S_IR S_WATER S_AIR_QUALITY };
+        S_ARDUINO_REPEATER_NODE S_LOCK S_IR S_WATER S_AIR_QUALITY S_CUSTOM S_DUST
+        S_SCENE_CONTROLLER };
         
 #-- Datastream types
 use enum qw { ST_FIRMWARE_CONFIG_REQUEST=0 ST_FIRMWARE_CONFIG_RESPONSE ST_FIRMWARE_REQUEST ST_FIRMWARE_RESPONSE
@@ -88,8 +92,8 @@ use constant datastreamTypesToStr => qw{ ST_FIRMWARE_CONFIG_REQUEST ST_FIRMWARE_
         ST_SOUND ST_IMAGE };
 
 #-- Payload types
-use enum qw { P_STRING=0 P_BYTE P_INT16 P_UINT16 P_LONG32 P_ULONG32 P_CUSTOM };
-use constant payloadTypesToStr => qw{ P_STRING P_BYTE P_INT16 P_UINT16 P_LONG32 P_ULONG32 P_CUSTOM };
+use enum qw { P_STRING=0 P_BYTE P_INT16 P_UINT16 P_LONG32 P_ULONG32 P_CUSTOM P_FLOAT32 };
+use constant payloadTypesToStr => qw{ P_STRING P_BYTE P_INT16 P_UINT16 P_LONG32 P_ULONG32 P_CUSTOM P_FLOAT32 };
 
 use constant topicRoot => '/mySensors';    # Include leading slash, omit trailing slash
 
@@ -116,10 +120,9 @@ sub parseMsg
   my $msgRef = { radioId => $fields[0],
                  childId => $fields[1],
                  cmd     => $fields[2],
-                 ack     => 0,
-#                 ack     => $fields[3],    # ack is not (yet) passed with message
-                 subType => $fields[3],
-                 payload => $fields[4] };
+                 ack     => $fields[3],
+                 subType => $fields[4],
+                 payload => $fields[5] };
   return $msgRef;
 }
 
@@ -135,6 +138,7 @@ sub parseTopicMessage
   my $msgRef = { radioId => int($fields[0]),
                  childId => int($fields[1]),
                  cmd     => C_SET,
+                 ack     => 0,   # No way to tell ack from topic
                  subType => variableTypeToIdx( $fields[2] ),
                  payload => $message };
 #  print Dumper($msgRef);
