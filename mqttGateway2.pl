@@ -25,7 +25,7 @@
 
 local $ENV{ANYEVENT_MQTT_DEBUG} = 1;
 my $useSerial  = 1;
-
+my $serialHandle;
 use strict;
 use Cwd;
 use IO::Socket::INET;
@@ -141,8 +141,8 @@ sub initialiseSerialPort
 sub sendToSerialGateway
 {
 	my $message = shift;
-  $serialPort->write($message."\n");
-  print "Wrote to serial port: ".$message;
+  $serialHandle->push_write($message);
+  debug("Wrote to serial port: ".$message);
 }
 
 # sub readFromSerialGateway
@@ -164,7 +164,7 @@ sub sendToSerialGateway
 # }
   
 sub create_handle {
-  new AnyEvent::Handle(
+  return new AnyEvent::Handle(
     fh => $serialDevice->{'HANDLE'},
     on_error => sub {
       my ($handle, $fatal, $message) = @_;
@@ -294,7 +294,7 @@ sub onMqttPublish
   if ($useSerial== 0) {
     print $socktx "$mySnsMsg\n"; 
   } else {
-  
+    sendToSerialGateway("$mySnsMsg\n");
   }
 }                                  
 
@@ -394,26 +394,7 @@ sub onSocketRead
   my ($handle) = @_;
   chomp($handle->rbuf);
   debug($handle->rbuf);
-
-  my $msgRef = parseMsg($handle->rbuf);
-  dumpMsg($msgRef);
-  given ($msgRef->{'cmd'})
-  {
-    when ([C_PRESENTATION, C_SET, C_INTERNAL])
-    {
-      onNodePresenation($msgRef) if (($msgRef->{'childId'} == 255) && ($msgRef->{'cmd'} == C_PRESENTATION));
-      publish( createTopic($msgRef), $msgRef->{'payload'} );
-    }
-    when (C_REQ)
-    {
-      subscribe( createTopic($msgRef) );
-    }
-    default
-    {
-      # Ignore
-    }
-  }
-  
+  handleMessage($handle->rbuf);
   # Clear the buffer
   $handle->rbuf = "";
 }
@@ -421,9 +402,14 @@ sub onSocketRead
 sub onSerialRead
 {
   my ($line) = @_;
-    debug($line);
+  debug($line);
+  handleMessage($line);
+}
 
-  my $msgRef = parseMsg($line);
+sub handleMessage
+{
+  my $msg=shift;
+  my $msgRef = parseMsg($msg);
   dumpMsg($msgRef);
   given ($msgRef->{'cmd'})
   {
@@ -441,9 +427,7 @@ sub onSerialRead
       # Ignore
     }
   }
-  
-  # Clear the buffer
-  }
+}
 
 sub doShutdown
 {
@@ -459,7 +443,7 @@ sub onCtrlC
 
 # Install Ctrl-C handler
 $SIG{INT} = \&onCtrlC;
-my $serialHandle;
+
 
 initialiseSerialPort();
 while (1)
