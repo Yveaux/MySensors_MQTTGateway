@@ -120,13 +120,16 @@ sub debug
 sub initialiseSerialPort
 {
   print "Initialising serial port  $serialPort\n";
-	$serialDevice =  tie (*FH, 'Device::SerialPort', $serialPort)
+	$serialDevice =  tie (*FH, 'Device::SerialPort',$serialPort)
     || die "Can't tie: $!";
 	$serialDevice->baudrate(115200);
 	$serialDevice->databits(8);
 	$serialDevice->parity("none");
 	$serialDevice->stopbits(1);
   
+  $serialDevice->write_settings;
+  
+  # $serialDevice->write("Trying to write to the port");
   
 	my $tEnd = time()+2; # 2 seconds in future
 	while (time()< $tEnd) { # end latest after 2 seconds
@@ -145,27 +148,13 @@ sub initialiseSerialPort
 sub sendToSerialGateway
 {
 	my $message = shift;
-  $serialHandle->push_write($message);
+  
+  debug ("Wanting to write to serial ports");
+  # $serialHandle->push_write($message);
+  $serialDevice->write($message);
   debug("Wrote to serial port: ".$message);
 }
 
-# sub readFromSerialGateway
-# {
-  # my $char = $serialDevice->lookfor();
-  # my $output = "";
-  # while ($char ne "" && $char ne "\n") {
-    # $output.= $char;
-    # # Uncomment the following lines, for slower reading,
-    # # but lower CPU usage, and to avoid
-    # # buffer overflow due to sleep function.
- 
-    # # $port->lookclear;
-    # # sleep (1);
-    # $char = $serialDevice->lookfor();
-  # }
-  # print "Received serial string $output\n";
-  # return $output;
-# }
   
 sub create_handle {
   return new AnyEvent::Handle(
@@ -280,7 +269,7 @@ sub onMqttError
 {
   my ($fatal, $message) = @_;
   if ($fatal) {
-    die $message, "\n";
+    die "MQTT: ".$message, "\n";
   } else {
     warn $message, "\n";
   }
@@ -503,11 +492,13 @@ while (1)
     
 
     $cv->recv; 
+
   }
   or do
   { 
     print "Exception: ".$@."\n";
     doShutdown();
     print "Restarting...\n";
+        exit (0);
   }
 }
