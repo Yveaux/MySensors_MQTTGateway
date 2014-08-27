@@ -109,6 +109,8 @@ my $subscriptionStorageFile = "subscriptions.storage";
 my $cv;
 my $serialPort = "/dev/ttyUSB2";
 my $serialDevice;
+my $nodeFile = "nodes.txt";
+my %knownNodes;
 
 my @subscriptions;
 
@@ -116,6 +118,50 @@ sub debug
 {
   print "##" . join(" ", @_)."\n";
 }
+
+sub saveNode
+{
+  my $message = shift;
+  my $address = $message->{'radioId'};
+  my $name = $message->{'payload'};
+  if (exists($knownNodes{$address}) && $knownNodes{$address} ne $name) {
+    print "Possible duplicate\n";
+  }
+  $knownNodes{$address} = $name;
+  writeNodeFile();
+}  
+  
+sub writeNodeFile  
+{
+  open OUTPUT, ">", $nodeFile or die $!;
+  foreach my $key (sort keys %knownNodes) {
+    print OUTPUT $key."=".$knownNodes{$key}."\n";
+  }
+  close OUTPUT;
+}
+
+sub readNodeFile  
+{
+  open INPUT, "<", $nodeFile or return;
+  while (<INPUT>) {
+    my ($address, $name) = split /=/;
+    $knownNodes {$address} = $name;
+  }
+  close INPUT;
+}
+
+sub findFreeID
+{
+  my @keys= keys %knownNodes;
+  if ($keys >254) return 255;
+  for my $index (1..254) {
+    if (!exists($knownNodes{$index})    {
+      return $index;
+    }
+  }
+  return 255;
+}
+      
 
 sub initialiseSerialPort
 {
@@ -409,6 +455,7 @@ sub handleMessage
     when ([C_PRESENTATION, C_SET, C_INTERNAL])
     {
       onNodePresenation($msgRef) if (($msgRef->{'childId'} == 255) && ($msgRef->{'cmd'} == C_PRESENTATION));
+      saveNode($msgRef) if($msgRef->{'subType'} == I_SKETCH_NAME);
       publish( createTopic($msgRef), $msgRef->{'payload'} );
     }
     when (C_REQ)
@@ -425,6 +472,7 @@ sub handleMessage
 sub doShutdown
 {
   store(\@subscriptions, $subscriptionStorageFile) ;
+  
 }
 
 sub onCtrlC
