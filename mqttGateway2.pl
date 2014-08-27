@@ -147,7 +147,9 @@ sub readNodeFile
   open INPUT, "<", $nodeFile or return;
   while (<INPUT>) {
     if (index($_,'=') > -1) {
+      chomp;
       my ($address, $name) = split /=/;
+      
       $knownNodes {$address} = $name;
     }
   }
