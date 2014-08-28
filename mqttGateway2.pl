@@ -107,8 +107,11 @@ my $qos = MQTT_QOS_AT_LEAST_ONCE;
 my $keep_alive_timer = 120;
 my $subscriptionStorageFile = "subscriptions.storage";
 my $cv;
+my $socktx;
 my $serialPort = "/dev/ttyUSB2";
 my $serialDevice;
+my $nodeFile = "nodes.txt";
+my %knownNodes;
 
 my @subscriptions;
 
@@ -116,6 +119,63 @@ sub debug
 {
   print "##" . join(" ", @_)."\n";
 }
+
+sub saveNode
+{
+  my $message = shift;
+  my $address = $message->{'radioId'};
+  my $name = $message->{'payload'};
+  chomp $name;
+  if (exists($knownNodes{$address}) && $knownNodes{$address} ne $name) {
+    print "Possible duplicate\n";
+  }
+  $knownNodes{$address} = $name;
+  writeNodeFile();
+}  
+  
+sub writeNodeFile  
+{
+  open OUTPUT, ">", $nodeFile or die $!;
+  foreach my $key (sort keys %knownNodes) {
+    print OUTPUT $key."=".$knownNodes{$key}."\n";
+  }
+  close OUTPUT;
+}
+
+sub readNodeFile  
+{
+  open INPUT, "<", $nodeFile or return;
+  while (<INPUT>) {
+    if (index($_,'=') > -1) {
+      chomp;
+      my ($address, $name) = split /=/;
+      
+      $knownNodes {$address} = $name;
+    }
+  }
+  close INPUT;
+}
+
+sub findFreeID
+{
+  readNodeFile();
+  print "Finding free ID\n";
+  # my @key_list= keys %knownNodes;
+  # if ($key_list >254) return 255;
+  for my $index (1..254) {
+    if (!exists($knownNodes{$index})) {
+      print "Found $index\n";
+      return $index;
+    }
+  }
+  
+  print "Found nothing, returning  255\n";
+  return 255;
+}
+
+
+
+      
 
 sub initialiseSerialPort
 {
@@ -208,6 +268,25 @@ sub parseTopicMessage
   return $msgRef;
 }
 
+sub assignID
+{
+  print  "ID request received\n";
+  my $msgRef = shift;
+  my @fields = ( $msgRef->{'radioId'},
+                 $msgRef->{'childId'},
+                 C_INTERNAL,
+                 0,
+                 I_ID_RESPONSE,
+                 findFreeID);
+  my $message = join(';', @fields);
+  debug($message); 
+  if ($useSerial== 0) {
+    print $socktx "$message\n"; 
+  } else {
+    sendToSerialGateway("$message\n");
+  }
+}
+
 sub createMsg
 {
   my $msgRef = shift;
@@ -255,7 +334,7 @@ sub createTopic
 my $mqtt;
 # Open a separate socket connection for sending.
 # TODO: I guess this should not be required.... Figure out how...
-my $socktx;
+
 if($useSerial== 0) {
   $socktx = new IO::Socket::INET (
     PeerHost => $mysnsHost,
@@ -409,6 +488,8 @@ sub handleMessage
     when ([C_PRESENTATION, C_SET, C_INTERNAL])
     {
       onNodePresenation($msgRef) if (($msgRef->{'childId'} == 255) && ($msgRef->{'cmd'} == C_PRESENTATION));
+      saveNode($msgRef) if($msgRef->{'subType'} == I_SKETCH_NAME);
+      assignID($msgRef) if($msgRef->{'childId'} == 255 && $msgRef->{'cmd'} ==C_INTERNAL && $msgRef->{'subType'} == I_ID_REQUEST);
       publish( createTopic($msgRef), $msgRef->{'payload'} );
     }
     when (C_REQ)
@@ -425,6 +506,7 @@ sub handleMessage
 sub doShutdown
 {
   store(\@subscriptions, $subscriptionStorageFile) ;
+  
 }
 
 sub onCtrlC
