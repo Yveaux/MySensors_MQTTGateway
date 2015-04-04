@@ -108,7 +108,7 @@ my $keep_alive_timer = 120;
 my $subscriptionStorageFile = "subscriptions.storage";
 my $cv;
 my $socktx;
-my $serialPort = "/dev/ttyUSB2";
+my $serialPort = "/dev/mysensorsUSB";
 my $serialDevice;
 my $nodeFile = "nodes.txt";
 my %knownNodes;
@@ -277,7 +277,7 @@ sub assignID
                  C_INTERNAL,
                  0,
                  I_ID_RESPONSE,
-                 findFreeID);
+                 findFreeID());
   my $message = join(';', @fields);
   debug($message); 
   if ($useSerial== 0) {
