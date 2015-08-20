@@ -6,7 +6,8 @@
 #
 # Created by Ivo Pullens, Emmission, 2014 -- www.emmission.nl
 #
-# Tested with MySensors 1.4beta (July 27, 2014) (www.mysensors.org)
+# Tested with MySensors 1.4.1 (July 17, 2015) (www.mysensors.org)
+#           & MySensors 1.5   (Aug  17, 2015)
 # and Mosquitto MQTT Broker (mosquitto.org) on Ubuntu Linux 12.04.
 # 
 # This program is free software: you can redistribute it and/or modify
@@ -24,21 +25,18 @@
 #
 
 local $ENV{ANYEVENT_MQTT_DEBUG} = 1;
-my $useSerial  = 1;
-my $serialHandle;
+
 use strict;
 use Cwd;
 use IO::Socket::INET;
 use Net::MQTT::Constants;
-#use AnyEvent::IO;
 use AnyEvent::Socket;
-use AnyEvent::Handle;
 use AnyEvent::MQTT;
 use AnyEvent::Strict;   # check parameters passed to callbacks 
-#use WebSphere::MQTT::Client;
 use Data::Dumper;
 use List::Util qw(first);
 use Storable;
+use Time::Zone;
 use v5.14;              # Requires support for given/when constructs
 use Device::SerialPort;
 
@@ -52,13 +50,13 @@ use enum qw { V_TEMP=0 V_HUM V_LIGHT V_DIMMER V_PRESSURE V_FORECAST V_RAIN
         V_IMPEDANCE V_ARMED V_TRIPPED V_WATT V_KWH V_SCENE_ON V_SCENE_OFF
         V_HEATER V_HEATER_SW V_LIGHT_LEVEL V_VAR1 V_VAR2 V_VAR3 V_VAR4 V_VAR5
         V_UP V_DOWN V_STOP V_IR_SEND V_IR_RECEIVE V_FLOW V_VOLUME V_LOCK_STATUS
-        V_DUST_LEVEL };
+        V_DUST_LEVEL V_VOLTAGE V_CURRENT };
 use constant variableTypesToStr => qw{ V_TEMP V_HUM V_LIGHT V_DIMMER V_PRESSURE V_FORECAST V_RAIN
         V_RAINRATE V_WIND V_GUST V_DIRECTION V_UV V_WEIGHT V_DISTANCE
         V_IMPEDANCE V_ARMED V_TRIPPED V_WATT V_KWH V_SCENE_ON V_SCENE_OFF
         V_HEATER V_HEATER_SW V_LIGHT_LEVEL V_VAR1 V_VAR2 V_VAR3 V_VAR4 V_VAR5
         V_UP V_DOWN V_STOP V_IR_SEND V_IR_RECEIVE V_FLOW V_VOLUME V_LOCK_STATUS
-        V_DUST_LEVEL };
+        V_DUST_LEVEL V_VOLTAGE V_CURRENT };
 
 sub variableTypeToIdx
 {
@@ -70,11 +68,11 @@ sub variableTypeToIdx
 use enum qw { I_BATTERY_LEVEL=0 I_TIME I_VERSION I_ID_REQUEST I_ID_RESPONSE
         I_INCLUSION_MODE I_CONFIG I_FIND_PARENT I_FIND_PARENT_RESPONSE
         I_LOG_MESSAGE I_CHILDREN I_SKETCH_NAME I_SKETCH_VERSION
-        I_REBOOT };
+        I_REBOOT I_GATEWAY_READY };
 use constant internalMessageTypesToStr => qw{ I_BATTERY_LEVEL I_TIME I_VERSION I_ID_REQUEST I_ID_RESPONSE
         I_INCLUSION_MODE I_CONFIG I_FIND_PARENT I_FIND_PARENT_RESPONSE
         I_LOG_MESSAGE I_CHILDREN I_SKETCH_NAME I_SKETCH_VERSION
-        I_REBOOT };
+        I_REBOOT I_GATEWAY_READY };
 
 #-- Sensor types
 use enum qw { S_DOOR=0 S_MOTION S_SMOKE S_LIGHT S_DIMMER S_COVER S_TEMP S_HUM S_BARO S_WIND
@@ -96,22 +94,31 @@ use constant datastreamTypesToStr => qw{ ST_FIRMWARE_CONFIG_REQUEST ST_FIRMWARE_
 use enum qw { P_STRING=0 P_BYTE P_INT16 P_UINT16 P_LONG32 P_ULONG32 P_CUSTOM P_FLOAT32 };
 use constant payloadTypesToStr => qw{ P_STRING P_BYTE P_INT16 P_UINT16 P_LONG32 P_ULONG32 P_CUSTOM P_FLOAT32 };
 
-use constant topicRoot => '/mySensors';    # Include leading slash, omit trailing slash
+use constant topicRoot => '/mySensors';    # Omit trailing slash
 
 my $mqttHost = 'localhost';         # Hostname of MQTT broker
-my $mqttPort = 8883;                # Port of MQTT broker
-my $mysnsHost = '192.168.1.10';     # IP of MySensors Ethernet gateway
-my $mysnsPort = 5003;               # Port of MySensors Ethernet gateway
+my $mqttPort = 1883;                # Port of MQTT broker
+
+# -- Switch to choose between Ethernet gateway or serial gateway
+my $useSerial = 0;
+
+# -- Settings when using Ethernet gateway
+my $mysnsHost   = '192.168.1.10';   # IP of MySensors Ethernet gateway
+my $mysnsPort   = 5003;             # Port of MySensors Ethernet gateway
+
+# -- Settings when using Serial gateway
+my $serialPort   = "/dev/ttyUSB2";
+my $serialBaud   = 115200;
+my $serialBits   = 8;
+my $serialParity = "none";
+my $serialStop   = 1;
+  
+  
 my $retain = 1;
 my $qos = MQTT_QOS_AT_LEAST_ONCE;
 my $keep_alive_timer = 120;
 my $subscriptionStorageFile = "subscriptions.storage";
-my $cv;
-my $socktx;
-my $serialPort = "/dev/mysensorsUSB";
 my $serialDevice;
-my $nodeFile = "nodes.txt";
-my %knownNodes;
 
 my @subscriptions;
 
@@ -120,125 +127,32 @@ sub debug
   print "##" . join(" ", @_)."\n";
 }
 
-sub saveNode
-{
-  my $message = shift;
-  my $address = $message->{'radioId'};
-  my $name = $message->{'payload'};
-  chomp $name;
-  if (exists($knownNodes{$address}) && $knownNodes{$address} ne $name) {
-    print "Possible duplicate\n";
-  }
-  $knownNodes{$address} = $name;
-  writeNodeFile();
-}  
-  
-sub writeNodeFile  
-{
-  open OUTPUT, ">", $nodeFile or die $!;
-  foreach my $key (sort keys %knownNodes) {
-    print OUTPUT $key."=".$knownNodes{$key}."\n";
-  }
-  close OUTPUT;
-}
-
-sub readNodeFile  
-{
-  open INPUT, "<", $nodeFile or return;
-  while (<INPUT>) {
-    if (index($_,'=') > -1) {
-      chomp;
-      my ($address, $name) = split /=/;
-      
-      $knownNodes {$address} = $name;
-    }
-  }
-  close INPUT;
-}
-
-sub findFreeID
-{
-  readNodeFile();
-  print "Finding free ID\n";
-  # my @key_list= keys %knownNodes;
-  # if ($key_list >254) return 255;
-  for my $index (1..254) {
-    if (!exists($knownNodes{$index})) {
-      print "Found $index\n";
-      return $index;
-    }
-  }
-  
-  print "Found nothing, returning  255\n";
-  return 255;
-}
-
-
-
-      
-
 sub initialiseSerialPort
 {
   print "Initialising serial port  $serialPort\n";
-	$serialDevice =  tie (*FH, 'Device::SerialPort',$serialPort)
-    || die "Can't tie: $!";
-	$serialDevice->baudrate(115200);
-	$serialDevice->databits(8);
-	$serialDevice->parity("none");
-	$serialDevice->stopbits(1);
-  
-  $serialDevice->write_settings;
-  
-  # $serialDevice->write("Trying to write to the port");
-  
-	my $tEnd = time()+2; # 2 seconds in future
-	while (time()< $tEnd) { # end latest after 2 seconds
-		my $c = $serialDevice->lookfor(); # char or nothing
-		next if $c eq ""; # restart if noting
-		print $c; # uncomment if you want to see the gremlin
-		last;
-	}
-	while (1) { # and all the rest of the gremlins as they come in one piece
-		my $c = $serialDevice->lookfor(); # get the next one
-		last if $c eq ""; # or we're done
-		print $c; # uncomment if you want to see the gremlin
-	}
+  $serialDevice = tie (*FH, 'Device::SerialPort', $serialPort) || die "Can't tie: $!";
+  $serialDevice->baudrate($serialBaud);
+  $serialDevice->databits($serialBits);
+  $serialDevice->parity($serialParity);
+  $serialDevice->stopbits($serialStop);
+
+  my $tEnd = time()+2; # 2 seconds in future
+  while (time()< $tEnd) { # end latest after 2 seconds
+    my $c = $serialDevice->lookfor(); # char or nothing
+    next if $c eq ""; # restart if noting
+    print $c; # uncomment if you want to see the gremlin
+    last;
+  }
+  while (1) { # and all the rest of the gremlins as they come in one piece
+    my $c = $serialDevice->lookfor(); # get the next one
+    last if $c eq ""; # or we're done
+    print $c; # uncomment if you want to see the gremlin
+  }
 }
 
-sub sendToSerialGateway
-{
-	my $message = shift;
-  
-  debug ("Wanting to write to serial ports");
-  # $serialHandle->push_write($message);
-  $serialDevice->write($message);
-  debug("Wrote to serial port: ".$message);
-}
-
-  
-sub create_handle {
-  return new AnyEvent::Handle(
-    fh => $serialDevice->{'HANDLE'},
-    on_error => sub {
-      my ($handle, $fatal, $message) = @_;
-      $handle->destroy;
-      undef $handle;
-      $cv->send("$fatal: $message");
-    },
-    on_read => sub {
-      my $handle = shift;
-      $handle->push_read(line => sub {
-        my ($handle, $line) = @_;
-        onSerialRead($line);
-      });
-    }
-  );
-}  
-    
 sub parseMsg
 {
   my $txt = shift;
-  chomp $txt;
   my @fields = split(/;/,$txt);
   my $msgRef = { radioId => $fields[0],
                  childId => $fields[1],
@@ -266,25 +180,6 @@ sub parseTopicMessage
                  payload => $message };
 #  print Dumper($msgRef);
   return $msgRef;
-}
-
-sub assignID
-{
-  print  "ID request received\n";
-  my $msgRef = shift;
-  my @fields = ( $msgRef->{'radioId'},
-                 $msgRef->{'childId'},
-                 C_INTERNAL,
-                 0,
-                 I_ID_RESPONSE,
-                 findFreeID());
-  my $message = join(';', @fields);
-  debug($message); 
-  if ($useSerial== 0) {
-    print $socktx "$message\n"; 
-  } else {
-    sendToSerialGateway("$message\n");
-  }
 }
 
 sub createMsg
@@ -334,8 +229,9 @@ sub createTopic
 my $mqtt;
 # Open a separate socket connection for sending.
 # TODO: I guess this should not be required.... Figure out how...
-
-if($useSerial== 0) {
+my $socktx = undef;
+if(!$useSerial)
+{
   $socktx = new IO::Socket::INET (
     PeerHost => $mysnsHost,
     PeerPort => $mysnsPort,
@@ -348,7 +244,7 @@ sub onMqttError
 {
   my ($fatal, $message) = @_;
   if ($fatal) {
-    die "MQTT: ".$message, "\n";
+    die $message, "\n";
   } else {
     warn $message, "\n";
   }
@@ -363,11 +259,7 @@ sub onMqttPublish
   my $mySnsMsg = createMsg($msgRef);
   debug($mySnsMsg); 
   print "Publish $topic: $message => $mySnsMsg\n";
-  if ($useSerial== 0) {
-    print $socktx "$mySnsMsg\n"; 
-  } else {
-    sendToSerialGateway("$mySnsMsg\n");
-  }
+  print $socktx "$mySnsMsg\n" if (defined $socktx);
 }                                  
 
 # Callback called when socket connection generates an error
@@ -461,35 +353,32 @@ sub onNodePresenation
   }
 }
 
-sub onSocketRead
+sub onRequestTime
 {
-  my ($handle) = @_;
-  chomp($handle->rbuf);
-  debug($handle->rbuf);
-  handleMessage($handle->rbuf);
-  # Clear the buffer
-  $handle->rbuf = "";
+  # Node requests current time from gateway
+  my $msgRef = shift;
+  # Get seconds since epoch, but correct for local time zone
+  my $ts = time + tz_local_offset();
+  $msgRef->{'payload'} = $ts;
+  my $mySnsMsg = createMsg($msgRef);
+  print "Request time: $ts => $mySnsMsg\n";
+  print $socktx "$mySnsMsg\n" if (defined $socktx); 
 }
 
-sub onSerialRead
+sub handleRead
 {
-  my ($line) = @_;
-  debug($line);
-  handleMessage($line);
-}
+  my $data = shift;
+  chomp($data);
+  debug($data);
 
-sub handleMessage
-{
-  my $msg=shift;
-  my $msgRef = parseMsg($msg);
+  my $msgRef = parseMsg($data);
   dumpMsg($msgRef);
   given ($msgRef->{'cmd'})
   {
     when ([C_PRESENTATION, C_SET, C_INTERNAL])
     {
       onNodePresenation($msgRef) if (($msgRef->{'childId'} == 255) && ($msgRef->{'cmd'} == C_PRESENTATION));
-      saveNode($msgRef) if($msgRef->{'subType'} == I_SKETCH_NAME);
-      assignID($msgRef) if($msgRef->{'childId'} == 255 && $msgRef->{'cmd'} ==C_INTERNAL && $msgRef->{'subType'} == I_ID_REQUEST);
+      onRequestTime($msgRef)     if (($msgRef->{'cmd'} == C_INTERNAL) && ($msgRef->{'subType'} == I_TIME));
       publish( createTopic($msgRef), $msgRef->{'payload'} );
     }
     when (C_REQ)
@@ -502,11 +391,24 @@ sub handleMessage
     }
   }
 }
+  
+sub onSocketRead
+{
+  my $handle = shift;
+  handleRead($handle->rbuf);
+  
+  # Clear the buffer
+  $handle->rbuf = "";
+}
+
+sub onSerialRead
+{
+  handleRead(shift);
+}
 
 sub doShutdown
 {
   store(\@subscriptions, $subscriptionStorageFile) ;
-  
 }
 
 sub onCtrlC
@@ -516,11 +418,14 @@ sub onCtrlC
   exit;
 }
 
+# Flush STDOUT
+$| = 1;
+
 # Install Ctrl-C handler
 $SIG{INT} = \&onCtrlC;
 
+initialiseSerialPort()  if ($useSerial);
 
-initialiseSerialPort();
 while (1)
 {
   # Run code in eval loop, so die's are caught with error message stored in $@
@@ -536,7 +441,31 @@ while (1)
 #          clean_session => 0,   # Retain client subscriptions etc
           client_id => 'MySensors',
           );
-    if ($useSerial==0) {
+
+    my $cv;
+    
+    if ($useSerial)
+    {
+      my $handle;
+      $handle = AnyEvent::Handle->new(
+        fh => $serialDevice->{'HANDLE'},
+        on_error => sub {
+          my ($handle, $fatal, $message) = @_;
+          $handle->destroy;
+          undef $handle;
+          $cv->send("$fatal: $message");
+        },
+        on_read => sub {
+          my $handle = shift;
+          $handle->push_read(line => sub {
+            my ($handle, $line) = @_;
+            onSerialRead($line);
+          });
+        }
+      );
+    }
+    else
+    {
       tcp_connect($mysnsHost, $mysnsPort, sub {
           my $sock = shift or die "FAIL";
           my $handle;
@@ -555,12 +484,6 @@ while (1)
         }  );
     }
     
-    $cv = AnyEvent->condvar;
-    
-    if ($useSerial==1) {
-      $serialHandle = create_handle();
-    }
-    
     # On shutdown active subscriptions will be saved to file. Read this file here and restore subscriptions.
     if (-e $subscriptionStorageFile)
     {
@@ -572,15 +495,13 @@ while (1)
       }
     }
     
-
+    $cv = AnyEvent->condvar;
     $cv->recv; 
-
   }
   or do
   { 
     print "Exception: ".$@."\n";
     doShutdown();
     print "Restarting...\n";
-        exit (0);
   }
 }
