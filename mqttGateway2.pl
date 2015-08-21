@@ -282,32 +282,36 @@ sub onSocketDisconnect
 sub subscribe
 {
   my $topic = shift;
-  print "Subscribe '$topic'\n";
-  $mqtt->subscribe(
-      topic    => $topic,
-      callback => \&onMqttPublish,
-      qos      => $qos );
-#      $cv->recv; # subscribed,
-
-  # Add topic to list of subscribed topics, if not already present.
   if (!($topic ~~ @subscriptions))
   {
+    print "Subscribe '$topic'\n";
+    $mqtt->subscribe(
+        topic    => $topic,
+        callback => \&onMqttPublish,
+        qos      => $qos );
+  #      $cv->recv; # subscribed,
+
+    # Add topic to list of subscribed topics, if not already present.
     push(@subscriptions, $topic);
+  }  else  {
+    print "Subscribe '$topic' ignored -- already subscribed\n";
   }
 }
 
 sub unsubscribe
 {
   my $topic = shift;
-  print "Unsubscribe '$topic'\n";
-  $mqtt->unsubscribe(
-      topic    => $topic
-    );
-
-  # Remove topic from list of subscribed topics, if present.
   if ($topic ~~ @subscriptions)
   {
+    print "Unsubscribe '$topic'\n";
+    $mqtt->unsubscribe(
+        topic    => $topic
+      );
+
+    # Remove topic from list of subscribed topics, if present.
     @subscriptions = grep { !/^$topic$/ } @subscriptions;
+  }  else  {
+    print "Unsubscribe '$topic' ignored -- not subscribed\n";
   }
 }
 
