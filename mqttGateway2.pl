@@ -98,6 +98,7 @@ use constant topicRoot => '/mySensors';    # Omit trailing slash
 
 my $mqttHost = 'localhost';         # Hostname of MQTT broker
 my $mqttPort = 1883;                # Port of MQTT broker
+my $mqttClientId = "MySensors-".$$; # Unique client ID to broker
 
 # -- Switch to choose between Ethernet gateway or serial gateway
 my $useSerial = 0;
@@ -113,12 +114,13 @@ my $serialBits   = 8;
 my $serialParity = "none";
 my $serialStop   = 1;
   
-  
 my $retain = 1;
 my $qos = MQTT_QOS_AT_LEAST_ONCE;
 my $keep_alive_timer = 120;
 my $subscriptionStorageFile = "subscriptions.storage";
 my $serialDevice;
+my $mqtt = undef;
+my $gw_handle = undef;
 
 my @subscriptions;
 
@@ -131,6 +133,7 @@ sub initialiseSerialPort
 {
   print "Initialising serial port  $serialPort\n";
   $serialDevice = tie (*FH, 'Device::SerialPort', $serialPort) || die "Can't tie: $!";
+  *FH if 0;  # Prevent spurious warning
   $serialDevice->baudrate($serialBaud);
   $serialDevice->databits($serialBits);
   $serialDevice->parity($serialParity);
@@ -226,57 +229,14 @@ sub createTopic
   return sprintf("%s/%d/%d/%s", topicRoot, $msgRef->{'radioId'}, $msgRef->{'childId'}, $st);
 }
 
-my $mqtt;
-# Open a separate socket connection for sending.
-# TODO: I guess this should not be required.... Figure out how...
-my $socktx = undef;
-if(!$useSerial)
-{
-  $socktx = new IO::Socket::INET (
-    PeerHost => $mysnsHost,
-    PeerPort => $mysnsPort,
-    Proto => 'tcp',
-  ) or die "ERROR in Socket Creation : $!\n";
-}
-
-# Callback called when MQTT generates an error
-sub onMqttError
-{
-  my ($fatal, $message) = @_;
-  if ($fatal) {
-    die $message, "\n";
-  } else {
-    warn $message, "\n";
-  }
-}
-
 # Callback when MQTT broker publishes a message
 sub onMqttPublish
 {
   my($topic, $message) = @_;
-  debug("$topic:$message");
   my $msgRef = parseTopicMessage($topic, $message);
   my $mySnsMsg = createMsg($msgRef);
-  debug($mySnsMsg); 
-  print "Publish $topic: $message => $mySnsMsg\n";
-  print $socktx "$mySnsMsg\n" if (defined $socktx);
-}                                  
-
-# Callback called when socket connection generates an error
-sub onSocketError
-{
-  my ($handle, $fatal, $message) = @_;
-  if ($fatal) {
-    die $message, "\n";
-  } else {
-    warn $message, "\n";
-  }
-}
-
-sub onSocketDisconnect
-{
-  my ($handle) = @_;
-  $handle->destroy();
+  print "Publish to gateway $topic: $message => $mySnsMsg\n";
+  $gw_handle->push_write("$mySnsMsg\n") if (defined $gw_handle);
 }
 
 sub subscribe
@@ -327,7 +287,7 @@ sub publish
 {
   my ($topic, $message) = @_;
   $message = "" if !defined($message);
-  print "Publish '$topic':'$message'\n";
+  print "Publish to broker '$topic':'$message'\n";
   $mqtt->publish(
       topic   => $topic,
       message => $message,
@@ -366,14 +326,14 @@ sub onRequestTime
   $msgRef->{'payload'} = $ts;
   my $mySnsMsg = createMsg($msgRef);
   print "Request time: $ts => $mySnsMsg\n";
-  print $socktx "$mySnsMsg\n" if (defined $socktx); 
+  $gw_handle->push_write("$mySnsMsg\n") if (defined $gw_handle);
 }
 
 sub handleRead
 {
   my $data = shift;
   chomp($data);
-  debug($data);
+#  debug($data);
 
   my $msgRef = parseMsg($data);
   dumpMsg($msgRef);
@@ -396,31 +356,19 @@ sub handleRead
   }
 }
   
-sub onSocketRead
-{
-  my $handle = shift;
-  handleRead($handle->rbuf);
-  
-  # Clear the buffer
-  $handle->rbuf = "";
-}
-
-sub onSerialRead
-{
-  handleRead(shift);
-}
-
-sub doShutdown
-{
-  store(\@subscriptions, $subscriptionStorageFile) ;
-}
-
 sub onCtrlC
 {
   print "\nShutdown requested...\n";
-  doShutdown();
+  store(\@subscriptions, $subscriptionStorageFile);
   exit;
 }
+
+print "\n";
+print "MQTT Client Gateway for MySensors\n";
+print "Broker:        $mqttHost:$mqttPort\n";
+print "ClientID:      $mqttClientId\n";
+print "MySensors GW:  ".($useSerial ? "$serialPort, $serialBaud, $serialBits$serialParity$serialStop" : "$mysnsHost:$mysnsPort")."\n";
+print "\n";
 
 # Flush STDOUT
 $| = 1;
@@ -438,13 +386,20 @@ while (1)
   eval
   {
     $mqtt = AnyEvent::MQTT->new(
-          host => $mqttHost,
-          port => $mqttPort,
-          keep_alive_timer => $keep_alive_timer,
-          on_error => \&onMqttError,
+        host => $mqttHost,
+        port => $mqttPort,
+        keep_alive_timer => $keep_alive_timer,
+        on_error => sub {
+          my ($fatal, $message) = @_;
+          if ($fatal) {
+            die $message, "\n";
+          } else {
+            warn $message, "\n";
+          }
+        },
 #          clean_session => 0,   # Retain client subscriptions etc
-          client_id => 'MySensors',
-          );
+        client_id => $mqttClientId,
+        );
 
     my $cv;
     
@@ -463,7 +418,7 @@ while (1)
           my $handle = shift;
           $handle->push_read(line => sub {
             my ($handle, $line) = @_;
-            onSerialRead($line);
+            handleRead($line);
           });
         }
       );
@@ -472,23 +427,37 @@ while (1)
     {
       tcp_connect($mysnsHost, $mysnsPort, sub {
           my $sock = shift or die "FAIL";
-          my $handle;
-          $handle = AnyEvent::Handle->new(
+          $gw_handle = AnyEvent::Handle->new(
                fh => $sock,
-               on_error => \&onSocketError,
+               on_error => sub {
+                  my ($handle, $fatal, $message) = @_;
+                  if ($fatal) {
+                    die $message, "\n";
+                  } else {
+                    warn $message, "\n";
+                  }
+               },
                on_eof => sub {
-                  print "DISCONNECT!\n";
-                  $handle->destroy();
+                  $gw_handle->destroy();
+                  die "Disconnected from MySensors gateway!";
                },
                on_connect => sub {
                  my ($handle, $host, $port) = @_;
-                  print "Connected to MySensors gateway at $host:$port\n";
+                 print "Connected to MySensors gateway at $host:$port\n";
                },
-               on_read => \&onSocketRead );
-        }  );
+               on_read => sub {
+                 my $handle = shift;
+                 handleRead($handle->rbuf);
+                 # Clear the buffer
+                 $handle->rbuf = "";
+               }
+             );
+        }
+      );
     }
     
-    # On shutdown active subscriptions will be saved to file. Read this file here and restore subscriptions.
+    # On shutdown active subscriptions will be saved to file.
+    # Read this file here and restore subscriptions.
     if (-e $subscriptionStorageFile)
     {
       my $subscrRef = retrieve($subscriptionStorageFile);
@@ -505,7 +474,10 @@ while (1)
   or do
   { 
     print "Exception: ".$@."\n";
-    doShutdown();
+    store(\@subscriptions, $subscriptionStorageFile);
+
     print "Restarting...\n";
+    # Clear list of subscriptions or subscriptions will not be restored correctly.
+    @subscriptions = ();
   }
 }
