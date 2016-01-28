@@ -4,11 +4,12 @@
 # MQTT Gateway - A gateway to exchange MySensors messages from an
 #                ethernet gateway with an MQTT broker.
 #
-# Created by Ivo Pullens, Emmission, 2014 -- www.emmission.nl
+# Created by Ivo Pullens, Emmission, 2014-2016 -- www.emmission.nl
 #
-# Tested with MySensors 1.4.1 (July 17, 2015) (www.mysensors.org)
-#           & MySensors 1.5   (Aug  17, 2015)
-# and Mosquitto MQTT Broker (mosquitto.org) on Ubuntu Linux 12.04.
+# Tested with:
+# * MySensors 1.5.x
+# * Mosquitto 1.4.2 MQTT Broker (mosquitto.org)
+# * Ubuntu Linux 12.04.5 & 15.10.
 # 
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -24,6 +25,14 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 
+# Modules needed (to be installed through cpan command):
+# Net::MQTT::Constants
+# AnyEvent::Socket
+# AnyEvent::SerialPort
+# AnyEvent::MQTT
+# enum.pm
+
+
 local $ENV{ANYEVENT_MQTT_DEBUG} = 1;
 
 use strict;
@@ -31,6 +40,7 @@ use Cwd;
 use IO::Socket::INET;
 use Net::MQTT::Constants;
 use AnyEvent::Socket;
+use AnyEvent::SerialPort;
 use AnyEvent::MQTT;
 use AnyEvent::Strict;   # check parameters passed to callbacks 
 use Data::Dumper;
@@ -39,6 +49,8 @@ use Storable;
 use Time::Zone;
 use v5.14;              # Requires support for given/when constructs
 use Device::SerialPort;
+use Getopt::Long;
+use Fcntl ':flock';
 
 #-- Message types
 use enum qw { C_PRESENTATION=0 C_SET C_REQ C_INTERNAL C_STREAM };
@@ -94,82 +106,120 @@ use constant datastreamTypesToStr => qw{ ST_FIRMWARE_CONFIG_REQUEST ST_FIRMWARE_
 use enum qw { P_STRING=0 P_BYTE P_INT16 P_UINT16 P_LONG32 P_ULONG32 P_CUSTOM P_FLOAT32 };
 use constant payloadTypesToStr => qw{ P_STRING P_BYTE P_INT16 P_UINT16 P_LONG32 P_ULONG32 P_CUSTOM P_FLOAT32 };
 
-use constant topicRoot => '/mySensors';    # Omit trailing slash
+my $topicRoot = '/mySensors';       # Omit trailing slash
 
 my $mqttHost = 'localhost';         # Hostname of MQTT broker
 my $mqttPort = 1883;                # Port of MQTT broker
 my $mqttClientId = "MySensors-".$$; # Unique client ID to broker
 
-# -- Switch to choose between Ethernet gateway or serial gateway
-my $useSerial = 0;
-
 # -- Settings when using Ethernet gateway
-my $mysnsHost   = '192.168.1.10';   # IP of MySensors Ethernet gateway
+my $mysnsHost   = undef;            # IP of MySensors Ethernet gateway
 my $mysnsPort   = 5003;             # Port of MySensors Ethernet gateway
 
 # -- Settings when using Serial gateway
-my $serialPort   = "/dev/ttyUSB2";
+my $serialPort   = undef;
 my $serialBaud   = 115200;
 my $serialBits   = 8;
 my $serialParity = "none";
 my $serialStop   = 1;
   
+my $subscriptionStorageFile = undef;
+
+my $log = "STDOUT";                    # Default logging to stdout
+
+my $exit_cause = undef;
+my $helpme     = undef;
+if ( GetOptions ( 'serial:s'   => \$serialPort,
+                  'baud:i'     => \$serialBaud,
+                  'bits:i'     => \$serialBits,
+                  'parity:s'   => \$serialParity,
+                  'stop:i'     => \$serialStop,
+                  'root:s'     => \$topicRoot,
+                  'mqtthost:s' => \$mqttHost,
+                  'mqttport:i' => \$mqttPort,
+                  'gwhost:s'   => \$mysnsHost,
+                  'gwport:i'   => \$mysnsPort,
+                  'storage:s'  => \$subscriptionStorageFile,
+                  'log:s'      => \$log,
+                  'help|h'     => \$helpme ) )
+{
+    if (!defined($helpme))
+    {
+      if (!defined($serialPort) && !defined($mysnsHost))
+      {
+        $exit_cause = "Select either ethernet connection (--gwhost) or serial connection (--serial) to gateway";
+      }
+      elsif (defined($serialPort) && defined($mysnsHost))
+      {
+        $exit_cause = "Select either ethernet connection (--gwhost) or serial connection (--serial) to gateway, but not both";
+      }
+    }
+}
+else
+{
+    $exit_cause = "Illegal commandline options";
+}
+print STDERR "\n--- Error: $exit_cause ---\n" if (defined($exit_cause));
+PrintHelpAndExit() if (defined($helpme) || defined($exit_cause)); 
+
 my $retain = 1;
 my $qos = MQTT_QOS_AT_LEAST_ONCE;
 my $keep_alive_timer = 120;
-my $subscriptionStorageFile = "subscriptions.storage";
 my $serialDevice;
 my $mqtt = undef;
 my $gw_handle = undef;
-
 my @subscriptions;
+
+# -- Switch to choose between Ethernet gateway or serial gateway
+my $useSerial = defined($serialPort);
+
+sub gettime
+{
+  my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+  return sprintf("%04d%02d%02d-%02d:%02d:%02d", $year + 1900, $mon + 1, $mday, $hour, $min, $sec);
+}
+    
+sub dolog
+{
+  print gettime() . " " . join(" ", @_)."\n";
+}
 
 sub debug
 {
-  print "##" . join(" ", @_)."\n";
+#  print gettime() . " [" . join(" ", @_)."]\n";
 }
 
 sub initialiseSerialPort
 {
-  print "Initialising serial port  $serialPort\n";
-  $serialDevice = tie (*FH, 'Device::SerialPort', $serialPort) || die "Can't tie: $!";
-  *FH if 0;  # Prevent spurious warning
+  dolog("Initialising serial port  $serialPort");
+  $serialDevice = tie (*fh, 'Device::SerialPort', $serialPort) || die "Can't tie: $!";
   $serialDevice->baudrate($serialBaud);
   $serialDevice->databits($serialBits);
   $serialDevice->parity($serialParity);
   $serialDevice->stopbits($serialStop);
-
-  my $tEnd = time()+2; # 2 seconds in future
-  while (time()< $tEnd) { # end latest after 2 seconds
-    my $c = $serialDevice->lookfor(); # char or nothing
-    next if $c eq ""; # restart if noting
-    print $c; # uncomment if you want to see the gremlin
-    last;
-  }
-  while (1) { # and all the rest of the gremlins as they come in one piece
-    my $c = $serialDevice->lookfor(); # get the next one
-    last if $c eq ""; # or we're done
-    print $c; # uncomment if you want to see the gremlin
-  }
+  $serialDevice->write_settings;
+  # Flush serial buffers in case they contain old data/garbage
+  $serialDevice->purge_all();
 }
 
 sub parseMsg
 {
-  my $txt = shift;
-  my @fields = split(/;/,$txt);
+  my $raw = shift;
+  my @fields = split(/;/,$raw);
   my $msgRef = { radioId => $fields[0],
                  childId => $fields[1],
                  cmd     => $fields[2],
                  ack     => $fields[3],
                  subType => $fields[4],
-                 payload => $fields[5] };
+                 payload => $fields[5],
+                 raw     => $raw };
   return $msgRef;
 }
 
 sub parseTopicMessage
 {
   my ($topic, $message) = @_;
-  if ($topic !~ s/^@{[topicRoot]}\/?//)
+  if ($topic !~ s/^@{[$topicRoot]}\/?//)
   {
     # Topic root doesn't match
     return undef;
@@ -215,10 +265,15 @@ sub subTypeToStr
 
 sub dumpMsg
 {
+  my $rxtx = shift;
   my $msgRef = shift;
+  my $action = shift;
   my $cmd = (commandToStr)[$msgRef->{'cmd'}];
   my $st = subTypeToStr( $msgRef->{'cmd'}, $msgRef->{'subType'} );
-  printf("Rx: fr=%03d ci=%03d c=%03d(%-14s) st=%03d(%-16s) ack=%d %s\n", $msgRef->{'radioId'}, $msgRef->{'childId'}, $msgRef->{'cmd'}, $cmd, $msgRef->{'subType'}, $st, $msgRef->{'ack'}, defined($msgRef->{'payload'}) ? "'".$msgRef->{'payload'}."'" : "");
+  my $ack = $msgRef->{'ack'} ? "ack" : "noack";
+  my $payload = defined($msgRef->{'payload'}) ? "'".$msgRef->{'payload'}."'" : "";
+#  dolog(sprintf("%s: [%s] fr=%d ci=%d c=%s st=%s %s %s -> %s", $rxtx, $msgRef->{'raw'}, $msgRef->{'radioId'}, $msgRef->{'childId'}, $cmd, $st, $ack, $payload, $action));
+  dolog(sprintf("%s: [%-32s] fr=%03d ci=%03d c=%-14s st=%-16s %-5s %-20s -> %s", $rxtx, $msgRef->{'raw'}, $msgRef->{'radioId'}, $msgRef->{'childId'}, $cmd, $st, $ack, $payload, $action));
 }
 
 sub createTopic
@@ -226,7 +281,7 @@ sub createTopic
   my $msgRef = shift;
   my $st = subTypeToStr( $msgRef->{'cmd'}, $msgRef->{'subType'} );
   # Note: Addendum to spec: a topic ending in a slash is considered equivalent to the same topic without the slash -> So we leave out the trailing slash
-  return sprintf("%s/%d/%d/%s", topicRoot, $msgRef->{'radioId'}, $msgRef->{'childId'}, $st);
+  return sprintf("%s/%d/%d/%s", $topicRoot, $msgRef->{'radioId'}, $msgRef->{'childId'}, $st);
 }
 
 # Callback when MQTT broker publishes a message
@@ -235,7 +290,8 @@ sub onMqttPublish
   my($topic, $message) = @_;
   my $msgRef = parseTopicMessage($topic, $message);
   my $mySnsMsg = createMsg($msgRef);
-  print "Publish to gateway $topic: $message => $mySnsMsg\n";
+  $msgRef->{'raw'} = $mySnsMsg;
+  dumpMsg("TX", $msgRef, "Publish to gateway '$topic':'$message'");
   $gw_handle->push_write("$mySnsMsg\n") if (defined $gw_handle);
 }
 
@@ -244,7 +300,7 @@ sub subscribe
   my $topic = shift;
   if (!($topic ~~ @subscriptions))
   {
-    print "Subscribe '$topic'\n";
+    debug("Subscribe '$topic'");
     $mqtt->subscribe(
         topic    => $topic,
         callback => \&onMqttPublish,
@@ -254,7 +310,7 @@ sub subscribe
     # Add topic to list of subscribed topics, if not already present.
     push(@subscriptions, $topic);
   }  else  {
-    print "Subscribe '$topic' ignored -- already subscribed\n";
+    debug("Subscribe '$topic' ignored -- already subscribed");
   }
 }
 
@@ -263,7 +319,7 @@ sub unsubscribe
   my $topic = shift;
   if ($topic ~~ @subscriptions)
   {
-    print "Unsubscribe '$topic'\n";
+    dolog("Unsubscribe '$topic'");
     $mqtt->unsubscribe(
         topic    => $topic
       );
@@ -271,23 +327,16 @@ sub unsubscribe
     # Remove topic from list of subscribed topics, if present.
     @subscriptions = grep { !/^$topic$/ } @subscriptions;
   }  else  {
-    print "Unsubscribe '$topic' ignored -- not subscribed\n";
+    dolog("Unsubscribe '$topic' ignored -- not subscribed");
   }
 }
 
-sub gettime
-{
-  my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
-  $year += 1900;
-  $mon++;
-  return sprintf("%04d%02d%02d-%02d:%02d:%02d", $year, $mon, $mday, $hour, $min, $sec);
-}
 
 sub publish
 {
   my ($topic, $message) = @_;
   $message = "" if !defined($message);
-  print "Publish to broker '$topic':'$message'\n";
+#  debug("Publish to broker '$topic':'$message'");
   $mqtt->publish(
       topic   => $topic,
       message => $message,
@@ -311,7 +360,7 @@ sub onNodePresenation
   my $radioId = $msgRef->{'radioId'};
 
   # Remove existing subscriptions for this node
-  foreach my $topic( grep { /^@{[topicRoot]}\/$radioId\// } @subscriptions )
+  foreach my $topic( grep { /^@{[$topicRoot]}\/$radioId\// } @subscriptions )
   {
     unsubscribe($topic);
   }
@@ -325,7 +374,7 @@ sub onRequestTime
   my $ts = time + tz_local_offset();
   $msgRef->{'payload'} = $ts;
   my $mySnsMsg = createMsg($msgRef);
-  print "Request time: $ts => $mySnsMsg\n";
+  dolog("Request time: $ts => $mySnsMsg");
   $gw_handle->push_write("$mySnsMsg\n") if (defined $gw_handle);
 }
 
@@ -333,45 +382,73 @@ sub handleRead
 {
   my $data = shift;
   chomp($data);
-#  debug($data);
+  debug($data);
 
   my $msgRef = parseMsg($data);
-  dumpMsg($msgRef);
   given ($msgRef->{'cmd'})
   {
     when ([C_PRESENTATION, C_SET, C_INTERNAL])
     {
       onNodePresenation($msgRef) if (($msgRef->{'childId'} == 255) && ($msgRef->{'cmd'} == C_PRESENTATION));
       onRequestTime($msgRef)     if (($msgRef->{'cmd'} == C_INTERNAL) && ($msgRef->{'subType'} == I_TIME));
-      publish( createTopic($msgRef), $msgRef->{'payload'} );
+      my $topic   = createTopic($msgRef);
+      my $message = $msgRef->{'payload'};
+      dumpMsg("RX", $msgRef, "Publish to broker '$topic':'$message'");
+      publish( $topic, $message );
     }
     when (C_REQ)
     {
-      subscribe( createTopic($msgRef) );
+      my $topic   = createTopic($msgRef);
+      dumpMsg("RX", $msgRef, "Subscribe to '$topic'");
+      subscribe( $topic );
     }
     default
     {
       # Ignore
+      dumpMsg("RX", $msgRef, "Ignored");
     }
   }
 }
   
 sub onCtrlC
 {
-  print "\nShutdown requested...\n";
+  dolog("\nShutdown requested...");
   store(\@subscriptions, $subscriptionStorageFile);
   exit;
 }
 
-print "\n";
-print "MQTT Client Gateway for MySensors\n";
-print "Broker:        $mqttHost:$mqttPort\n";
-print "ClientID:      $mqttClientId\n";
-print "MySensors GW:  ".($useSerial ? "$serialPort, $serialBaud, $serialBits$serialParity$serialStop" : "$mysnsHost:$mysnsPort")."\n";
-print "\n";
-
+if ($log ne "STDOUT")
+{
+        # redirect STDOUT to logfile
+        open(OUT, ">>$log") || die "Unable to write to logfile '$log': $!\n";
+        *STDOUT = *OUT;
+}
 # Flush STDOUT
 $| = 1;
+
+# Define storage file, when not available
+if (!defined($subscriptionStorageFile))
+{
+    $subscriptionStorageFile = $useSerial ? $serialPort : $mysnsHost."_".$mysnsPort;
+    $subscriptionStorageFile =~s/[\\\/\:\? ]/_/g;
+    $subscriptionStorageFile = "/var/run/mqttMySensors/Gateway_".$subscriptionStorageFile;
+}
+
+# If file does not exist, create it here
+if (! -e $subscriptionStorageFile)
+{
+  store(\@subscriptions, $subscriptionStorageFile) || die "Failed to create subscription file '$subscriptionStorageFile': $!";
+}
+# Get an exclusive lock on the subscription file, to prevent multiple instances from running simultaneously.
+die "Fatal error: Unable to open subscription file '$subscriptionStorageFile'. Another instance of this script might be running." unless (open SS, $subscriptionStorageFile);
+die "Fatal error: Subscription file '$subscriptionStorageFile' is locked by another process." unless(flock SS, LOCK_EX|LOCK_NB);
+
+dolog("MQTT Client Gateway for MySensors");
+dolog("Broker:        $mqttHost:$mqttPort");
+dolog("ClientID:      $mqttClientId");
+dolog("MySensors GW:  ".($useSerial ? "$serialPort, $serialBaud, $serialBits$serialParity$serialStop" : "$mysnsHost:$mysnsPort"));
+dolog("Subscriptions: $subscriptionStorageFile");
+dolog("");
 
 # Install Ctrl-C handler
 $SIG{INT} = \&onCtrlC;
@@ -405,8 +482,7 @@ while (1)
     
     if ($useSerial)
     {
-      my $handle;
-      $handle = AnyEvent::Handle->new(
+      $gw_handle = AnyEvent::Handle->new(
         fh => $serialDevice->{'HANDLE'},
         on_error => sub {
           my ($handle, $fatal, $message) = @_;
@@ -443,7 +519,7 @@ while (1)
                },
                on_connect => sub {
                  my ($handle, $host, $port) = @_;
-                 print "Connected to MySensors gateway at $host:$port\n";
+                 dolog("Connected to MySensors gateway at $host:$port");
                },
                on_read => sub {
                  my $handle = shift;
@@ -458,10 +534,11 @@ while (1)
     
     # On shutdown active subscriptions will be saved to file.
     # Read this file here and restore subscriptions.
+dolog("trying to restore subscriptions");
     if (-e $subscriptionStorageFile)
     {
       my $subscrRef = retrieve($subscriptionStorageFile);
-      print "Restoring previous subscriptions:\n" if @$subscrRef;
+      dolog("Restoring previous subscriptions:") if @$subscrRef;
       foreach my $topic(@$subscrRef)
       {
         subscribe($topic);
@@ -473,11 +550,47 @@ while (1)
   }
   or do
   { 
-    print "Exception: ".$@."\n";
+    dolog("Exception: ".$@);
     store(\@subscriptions, $subscriptionStorageFile);
 
-    print "Restarting...\n";
+    dolog("Restarting...");
     # Clear list of subscriptions or subscriptions will not be restored correctly.
     @subscriptions = ();
   }
+}
+
+sub PrintHelpAndExit
+{
+print STDERR <<SYNTAX;
+    
+mqttGateway2 - Created by Ivo Pullens, Emmission, (c)2014-2016
+An MQTT gateway for use with the MySensors serial or ethernet gateway.
+
+Usage:      mqttGateway2 [--serial dev [--baud baudrate] [--bits bits] [--parity [none|odd|even]] [--stop numbits]] 
+                         [--gwhost hostip [--gwport port]]
+                         [--root mqttroot]
+                         [--mqtthost mqtthost] [--mqttport mqttport]
+                         [--storage file] [--log file]
+            mqttGateway2 --help
+
+Options:    For serial connection to gateway:
+            --serial    Serial device connected to MySensors gateway, e.g. /dev/ttyUSB1
+            --baud      Serial baudrate, defaults to 115200
+            --bits      Serial nr of bits, defaults to 8
+            --parity    Serial parity, default to none.
+            --stop      Serial stopbits, defaults to 1
+
+            For ethernet connection to gateway:
+            --gwhost    IP address of ethernet gateway
+            --gwport    Port of ethernet gateway, defaults to 5003
+
+            Generic options:
+            --root      MQTT root topic (no trailing slash), defaults to /mySensors
+            --mqtthost  IP address of MQTT broker, defaults to localhost
+            --mqttport  Port of MQTT broker, defaults to 1883
+            --storage   File used for storing active subscriptions, defaults to /var/run/mqttMySensors/Gateway_xxx
+            --log       File to log to, defaults to stdout
+
+SYNTAX
+    exit 1;
 }
